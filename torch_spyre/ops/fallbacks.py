@@ -233,3 +233,13 @@ def spyre__embedding(
     """
     # TODO: Remove this fallback once we enable gather/scatter ops on spyre
     return aten.embedding(weight, indices, padding_idx, scale_grad_by_freq, sparse)
+
+
+@register_fallback([aten._local_scalar_dense.default])
+def spyre__local_scalar_dense(self):
+    """
+    Fallback for converting a tensor to a Python scalar on Spyre.
+    This is used when calling .item() on a tensor.
+    """
+    # Move the tensor to CPU and then get the scalar value
+    return self.cpu().item()

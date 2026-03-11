@@ -803,6 +803,66 @@ class TestOps(TestCase):
 
         torch.testing.assert_close(cpu_y, spyre_y, rtol=self.rtol, atol=self.atol)
 
+    def test_local_scalar_dense_multiple(self):
+        """Test .item() on Spyre tensors with various values"""
+        dtype = torch.float16
+        values = [0.0, 1.0, -3.5, 100.0]
+
+        for v in values:
+            x = torch.tensor([v], dtype=dtype)
+            x_spyre = x.to("spyre")
+            result = x_spyre.item()
+            self.assertEqual(result, v)
+
+    def test_local_scalar_dense_different_dtypes(self):
+        """Test .item() with different dtypes"""
+        test_cases = [
+            (torch.float32, 3.14159, 5),  # (dtype, value, decimal_places)
+            (torch.float64, 2.71828, 5),
+            (torch.int32, 42, None),
+            (torch.int64, -100, None),
+            (torch.bool, True, None),
+            (torch.bool, False, None),
+        ]
+
+        for dtype, value, decimals in test_cases:
+            x = torch.tensor([value], dtype=dtype)
+            x_spyre = x.to("spyre")
+            result = x_spyre.item()
+
+            if decimals is not None:
+                # For floating point types, use assertAlmostEqual with specified precision
+                self.assertAlmostEqual(
+                    result, value, places=decimals,
+                    msg=f"Failed for dtype {dtype} with value {value}"
+                )
+            else:
+                # For integer and boolean types, use exact equality
+                self.assertEqual(
+                    result, value,
+                    f"Failed for dtype {dtype} with value {value}"
+                )
+
+    def test_local_scalar_dense_zero_dimensional(self):
+        """Test .item() on zero-dimensional (scalar) tensors"""
+        dtype = torch.float16
+        values = [0.0, 42.0, -8.5]
+
+        for v in values:
+            # Create a 0-dim tensor (scalar)
+            x = torch.tensor(v, dtype=dtype)
+            x_spyre = x.to("spyre")
+            result = x_spyre.item()
+            self.assertEqual(result, v)
+
+    def test_local_scalar_dense_multiple_elements_raises(self):
+        """Test that .item() on tensor with >1 element raises RuntimeError"""
+        x = torch.tensor([1.0, 2.0, 3.0], dtype=torch.float16)
+        x_spyre = x.to("spyre")
+
+        with self.assertRaises(RuntimeError):
+            x_spyre.item()
+
     @unittest.skip("TODO: Needs more debug")
     def test_all_ops(self):
         def test_op(declaration):
