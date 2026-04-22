@@ -365,26 +365,6 @@ def full_decomp(
     return torch.ops.spyre.full(size, fill_value, device, dtype=dtype)
 
 
-@register_spyre_decomposition([torch.ops.aten.gt.Tensor, torch.ops.aten.gt.Tensor_out])
-def gt_decomp(
-    input: torch.Tensor, other: torch.Tensor, *, out: Optional[torch.Tensor] = None
-) -> torch.Tensor:
-    # TODO: Implement greaterthan in the backend compiler
-    out_ge = torch.ge(input, other).to(dtype=torch.float16)
-    out_ne = torch.ne(input, other).to(dtype=torch.float16)
-    return torch.mul(out_ge, out_ne, out=out).to(dtype=torch.bool)
-
-
-@register_spyre_decomposition([torch.ops.aten.lt.Tensor, torch.ops.aten.lt.Tensor_out])
-def lt_decomp(
-    input: torch.Tensor, other: torch.Tensor, *, out: Optional[torch.Tensor] = None
-) -> torch.Tensor:
-    # TODO: Implement lessthan in the backend compiler
-    out_le = torch.le(input, other).to(dtype=torch.float16)
-    out_ne = torch.ne(input, other).to(dtype=torch.float16)
-    return torch.mul(out_le, out_ne, out=out).to(dtype=torch.bool)
-
-
 @register_spyre_decomposition([torch.ops.aten.logical_not])
 def logical_not_decomp(input: torch.Tensor) -> torch.Tensor:
     # Currently falling back to torch.zeros_like for dtypes other than bool
@@ -499,7 +479,7 @@ def spyre_softplus(
 def spyre_linear(
     input: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor | None = None
 ) -> torch.Tensor:
-    weight = weight.transpose(-1, -2).contiguous()
+    weight = weight.transpose(-1, -2)
     while weight.dim() < input.dim():
         weight = torch.unsqueeze(weight, 0)
     out = input @ weight
@@ -533,6 +513,7 @@ def spyre__sdpa_overrideable(
 ]:
     batch_size = query.size(0)
     num_heads = query.size(1)
+    num_kvheads = key.size(1)
     max_seqlen_q = query.size(2)
     max_seqlen_kv = key.size(2)
 
@@ -552,6 +533,10 @@ def spyre__sdpa_overrideable(
     query = query * scaling_factor_q
     key = key * scaling_factor_k
 
+    expansion = num_heads // num_kvheads
+    if expansion != 1:
+        key = key.unsqueeze(2).expand(-1, -1, expansion, -1, -1).flatten(1, 2)
+        value = value.unsqueeze(2).expand(-1, -1, expansion, -1, -1).flatten(1, 2)
     key_t = key.transpose(-2, -1).clone(memory_format=torch.contiguous_format)
 
     attn = torch.matmul(query, key_t)
@@ -615,12 +600,68 @@ def decompose_cat(
         offset = 0
         for input in tensors:
             output = torch.ops.spyre.overwrite(
-                input=input, output=output, dim=dim, offset=offset
+                input=input, output=output, dims=[dim], offsets=[offset]
             )
             offset += input.size(dim)
         return output
     else:
         return orig_decomp
+
+
+@register_spyre_decomposition([torch.ops.aten.constant_pad_nd.default])
+def pad_decomp(
+    input: torch.Tensor,
+    pad: list[int],
+    value: float = 0,
+) -> torch.Tensor:
+    # pad is in reverse dim order: (left_last, right_last, left_2nd_last, right_2nd_last, ...)
+    n_dims_padded = len(pad) // 2
+
+    # Negative pad values (cropping) require reading from a non-zero storage
+    # offset or a sub-stick position, neither of which the SFP supports.
+    if any(p < 0 for p in pad):
+        raise Unsupported(
+            f"constant_pad_nd: negative padding (cropping) is not supported on "
+            f"Spyre (pad={pad})"
+        )
+
+    # Left-padding on the last (stick) dimension shifts the output start address
+    # by `left` elements. The hardware can only express this in whole sticks, so
+    # `left` must be a multiple of the stick size (64 fp16 elements).
+    # Sub-stick left-padding on the last dimension is tracked in:
+    # https://github.com/torch-spyre/torch-spyre/issues/1464
+    last_dim_left = pad[0]
+    if last_dim_left > 0:
+        elems_per_stick = 128 // input.element_size()
+        if last_dim_left % elems_per_stick != 0:
+            raise Unsupported(
+                f"constant_pad_nd: sub-stick left-padding on the last dimension is "
+                f"not supported on Spyre (pad={pad}, left={last_dim_left}, "
+                f"stick_size={elems_per_stick})"
+            )
+
+    # Build the padded output shape and collect which dimensions need padding.
+    scalar = torch.ops.spyre.full([1], value, input.device, dtype=input.dtype)
+    output_size = list(input.size())
+    dims: list[int] = []
+    offsets: list[int] = []
+    for i in range(n_dims_padded - 1, -1, -1):
+        left = pad[2 * i]
+        right = pad[2 * i + 1]
+        if left + right == 0:
+            continue
+        dim = input.dim() - 1 - i
+        output_size[dim] += left + right
+        dims.append(dim)
+        offsets.append(left)
+
+    if not dims:
+        return input
+
+    output = scalar.expand(output_size).clone()
+    return torch.ops.spyre.overwrite(
+        input=input, output=output, dims=dims, offsets=offsets
+    )
 
 
 ###############################################################################################

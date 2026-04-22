@@ -19,6 +19,7 @@ import unittest
 import psutil
 import warnings
 from contextlib import contextmanager
+import pytest
 
 import torch
 from torch.testing._internal.common_utils import run_tests, TestCase
@@ -303,6 +304,87 @@ class TestSpyre(TestCase):
 
         dev = torch._C._get_accelerator()
         assert str(dev) == "spyre"
+
+    def test_memory_allocated(self):
+        torch.spyre.memory.reset_peak_memory_stats()
+        torch.spyre.memory.reset_accumulated_memory_stats()
+
+        prev_allocated = torch.spyre.memory.memory_allocated()
+        prev_max_allocated = torch.spyre.memory.max_memory_allocated()
+
+        self.assertEqual(
+            prev_allocated, prev_max_allocated
+        )  # Due to reset_peak_memory_stats
+        x = torch.rand((64, 64), dtype=torch.float16)
+        mem_size = x.numel() * x.element_size()  # 8192 bytes
+        self.assertEqual(x.device.type, "cpu")
+        self.assertEqual(torch.spyre.memory.memory_allocated(), prev_allocated)
+
+        x = x.to("spyre")
+        self.assertEqual(x.device.type, "spyre")
+        self.assertEqual(
+            torch.spyre.memory.memory_allocated(), prev_allocated + mem_size
+        )
+
+        del x
+        self.assertEqual(torch.spyre.memory.memory_allocated(), prev_allocated)
+
+        # Test max
+        self.assertEqual(
+            torch.spyre.memory.max_memory_allocated(), prev_max_allocated + mem_size
+        )
+
+    def test_spyre_device_count_and_set_device(self):
+        count = torch.spyre.device_count()
+
+        assert isinstance(count, int)
+        assert count > 0
+
+        orig = torch.spyre.current_device()
+
+        try:
+            for i in range(min(2, count)):
+                torch.spyre.set_device(i)
+                assert torch.spyre.current_device() == i
+
+            with pytest.raises(Exception):
+                torch.spyre.set_device(count)
+
+            with pytest.raises(Exception):
+                torch.spyre.set_device(-1)
+        finally:
+            torch.spyre.set_device(orig)
+
+    def test_instantiate_device_type_tests_mro(self):
+        """Verify that instantiate_device_type_tests works with TestCase
+        base class and only_for=("privateuse1",).
+
+        Previously, inheriting from PrivateUse1TestBase caused an MRO
+        conflict when instantiate_device_type_tests tried to create a
+        dynamic subclass that also inherits PrivateUse1TestBase.
+        Using plain TestCase + only_for avoids the conflict.
+        """
+        from torch.testing._internal.common_device_type import (
+            instantiate_device_type_tests,
+        )
+
+        class _TestMROCheck(TestCase):
+            def test_device_is_spyre(self):
+                pass
+
+        ns = {"_TestMROCheck": _TestMROCheck}
+        # This must not raise TypeError about MRO
+        instantiate_device_type_tests(_TestMROCheck, ns, only_for=("privateuse1",))
+
+        # instantiate_device_type_tests should create a class named
+        # _TestMROCheckPRIVATEUSE1 in the namespace
+        assert "_TestMROCheckPRIVATEUSE1" in ns, (
+            f"Expected _TestMROCheckPRIVATEUSE1 in namespace, got {list(ns)}"
+        )
+
+        # The generated class should be instantiable (valid MRO)
+        cls = ns["_TestMROCheckPRIVATEUSE1"]
+        assert issubclass(cls, TestCase)
 
 
 if __name__ == "__main__":

@@ -25,7 +25,7 @@
 
 #include <cstdlib>  // std::getenv
 #include <flex/compiler_interface/dee_graph_converter.hpp>
-#include <flex/runtime/flex_factory.hpp>
+#include <flex/runtime_graph/flex_factory.hpp>
 #include <memory>
 #include <sendnn/graph.hpp>
 #include <sendnn/graph/graph_builder.hpp>
@@ -40,6 +40,8 @@
 
 #include "logging.h"
 #include "spyre_allocator.h"
+#include "spyre_device_enum.h"
+#include "spyre_guard.h"
 #include "spyre_mem.h"
 #include "spyre_sendnn_utils.h"
 #include "spyre_stream.h"
@@ -48,7 +50,7 @@
 
 namespace spyre {
 
-static constexpr int32_t kSpyreTensorLayoutPickleVersion = 1;
+static constexpr int32_t kSpyreTensorLayoutPickleVersion = 2;
 
 std::atomic<bool> g_downcast_warn_enabled{true};
 
@@ -73,13 +75,36 @@ static void init_from_env() {
 
 void _startRuntime() {
   DEBUGINFO("starting runtime");
+  // Determine logical device index with priority:
+  //   1. tls_idx (non-zero) — set via explicit set_device() call
+  //   2. LOCAL_RANK env var — set by torchrun per process
+  //   3. 0 — single-device / non-torchrun default
+  int logical_device_id = 0;
+  int tls_idx = static_cast<int>(SpyreGuardImpl::tls_idx);
+  if (tls_idx != 0) {
+    logical_device_id = tls_idx;
+  } else if (const char *lr = std::getenv("LOCAL_RANK")) {
+    logical_device_id = std::atoi(lr);
+  }
+  ensureSpyreDevicesEnv();
+
+  const auto &devices = getVisibleDevices();
+  if (logical_device_id >= 0 &&
+      logical_device_id < static_cast<int>(devices.size())) {
+    DEBUGINFO("logical_device_id =", logical_device_id,
+              "-> PCI bus ID =", devices[logical_device_id].pci_bus_id);
+  }
+
   std::shared_ptr<Runtime> runtime;
-  auto s = flex::initializeRuntime(&runtime);
+  auto s = flex::initializeRuntime(&runtime, logical_device_id);
   init_from_env();
   if (runtime) {
     GlobalRuntime::set(runtime);
     DEBUGINFO(s);
-    DEBUGINFO("runtime started");
+    std::string env_key = "AIU_WORLD_RANK_" + std::to_string(logical_device_id);
+    const char *pci = std::getenv(env_key.c_str());
+    DEBUGINFO("runtime started, device PCI bus ID:",
+              pci ? pci : "(default/senlib)");
   } else {
     DEBUGINFO("runtime FAILED TO START.");
     throw std::runtime_error("Failed to initialize Spyre runtime. ");
@@ -162,49 +187,33 @@ void launchKernel(std::string g2_path, std::vector<at::Tensor> args) {
     at::Tensor tmp_0;
     if (arg.dim() == 0) {
       tmp_0 = (at::ones({1}, arg.dtype()) * arg).to(arg.device());
-      auto tensor = createInputTensor(gl, tmp_0.storage().data_ptr().get(), i,
-                                      (args.size() >= 3) ? 2 : 1);
+      auto tensor =
+          createInputTensor(gl, tmp_0.storage().data_ptr().get(), i, 1);
       tensor.SetSpyreData(static_cast<SharedOwnerCtx *>(
                               tmp_0.storage().data_ptr().get_context())
                               ->owner);
       sen_inputs.push_back(tensor);
     } else {
-      auto tensor = createInputTensor(gl, arg.storage().data_ptr().get(), i,
-                                      (args.size() >= 3) ? 2 : 1);
+      auto tensor = createInputTensor(gl, arg.storage().data_ptr().get(), i, 1);
       tensor.SetSpyreData(
           static_cast<SharedOwnerCtx *>(arg.storage().data_ptr().get_context())
               ->owner);
       sen_inputs.push_back(tensor);
     }
   }
-  auto tensor = createOutputTensor(gl, args.back().storage().data_ptr().get(),
-                                   0, (args.size() >= 3) ? 2 : 1);
+  auto tensor =
+      createOutputTensor(gl, args.back().storage().data_ptr().get(), 0, 1);
   tensor.SetSpyreData(static_cast<SharedOwnerCtx *>(
                           args.back().storage().data_ptr().get_context())
                           ->owner);
   sen_outputs.push_back(tensor);
 
   // Execute device init
-  if (args.size() == 6) {
-    // Filling in segment 5 adds another input to the device init supernode
-    status =
-        gl.Predict(sendnn::Outputs(), {sen_inputs[1], sen_outputs.front()}, 1);
-    if (!status.IsOk()) throw std::runtime_error(status.Message());
-    status = gl.Compute(sen_outputs, sen_inputs, 2);
-    if (!status.IsOk()) throw std::runtime_error(status.Message());
-  } else if (args.size() >= 3) {
-    status = gl.Predict(sendnn::Outputs(), {sen_inputs[1]}, 1);
-    if (!status.IsOk()) throw std::runtime_error(status.Message());
+  status = gl.Predict(sendnn::Outputs(), sendnn::Inputs(), 0);
+  if (!status.IsOk()) throw std::runtime_error(status.Message());
 
-    status = gl.Compute(sen_outputs, sen_inputs, 2);
-    if (!status.IsOk()) throw std::runtime_error(status.Message());
-  } else {
-    status = gl.Predict(sendnn::Outputs(), sendnn::Inputs(), 0);
-    if (!status.IsOk()) throw std::runtime_error(status.Message());
-
-    status = gl.Compute(sen_outputs, sen_inputs, 1);
-    if (!status.IsOk()) throw std::runtime_error(status.Message());
-  }
+  status = gl.Compute(sen_outputs, sen_inputs, 1);
+  if (!status.IsOk()) throw std::runtime_error(status.Message());
 
   return;
 }
@@ -243,9 +252,8 @@ bool is_supported_dtype(c10::ScalarType dtype) {
   return sen_dtype_dev != DataFormats::INVALID &&
          elems_per_stick(sen_dtype_dev) > 0;
 }
-// TODO(tmhoangt): add real code
 int device_count() {
-  return 1;
+  return getVisibleDeviceCount();
 }
 
 }  // namespace spyre
@@ -262,7 +270,6 @@ PYBIND11_MODULE(_C, m) {
   py::class_<spyre::SpyreTensorLayout> dci_cls(m, "SpyreTensorLayout");
 
   dci_cls.def_readonly("device_size", &spyre::SpyreTensorLayout::device_size)
-      .def_readonly("dim_map", &spyre::SpyreTensorLayout::dim_map)
       .def_readonly("stride_map", &spyre::SpyreTensorLayout::stride_map)
       .def_readonly("device_dtype", &spyre::SpyreTensorLayout::device_dtype)
       .def("__str__",
@@ -270,7 +277,6 @@ PYBIND11_MODULE(_C, m) {
       .def("__repr__",
            [](const spyre::SpyreTensorLayout &c) { return c.toString(); })
       .def("elems_per_stick", &spyre::SpyreTensorLayout::elems_per_stick)
-      .def("host_stick_dim", &spyre::SpyreTensorLayout::host_stick_dim)
       .def(py::self == py::self)
       .def(py::init<std::vector<int64_t>, c10::ScalarType>(),
            py::arg("host_size"), py::arg("dtype"))
@@ -278,9 +284,8 @@ PYBIND11_MODULE(_C, m) {
                     std::vector<int32_t>>(),
            py::arg("host_size"), py::arg("host_strides"), py::arg("dtype"),
            py::arg("dim_order"))
-      .def(py::init<std::vector<int64_t>, std::vector<int32_t>,
-                    std::vector<int64_t>, DataFormats>(),
-           py::arg("device_size"), py::arg("dim_map"), py::arg("stride_map"),
+      .def(py::init<std::vector<int64_t>, std::vector<int64_t>, DataFormats>(),
+           py::arg("device_size"), py::arg("stride_map"),
            py::arg("device_dtype"))
       .def(py::pickle(
           [](const spyre::SpyreTensorLayout &p) {  // __getstate__
@@ -290,26 +295,34 @@ PYBIND11_MODULE(_C, m) {
             // returned object and the first element to be the
             // kSpyreTensorLayoutPickleVersion
             return py::make_tuple(spyre::kSpyreTensorLayoutPickleVersion,
-                                  p.device_size, p.dim_map, p.stride_map,
-                                  p.device_dtype);
+                                  p.device_size, p.stride_map, p.device_dtype);
           },
           [](py::tuple t) {  // __setstate__
-            if (t.size() != 5) {
-              throw py::value_error(
-                  "Invalid SpyreTensorLayout pickle: wrong tuple size");
-            }
-
             int32_t version = t[0].cast<int32_t>();
-            if (version != spyre::kSpyreTensorLayoutPickleVersion) {
+            if (version == 1) {
+              // Version 1 had: (version, device_size, dim_map, stride_map,
+              // device_dtype) — discard dim_map
+              if (t.size() != 5) {
+                throw py::value_error(
+                    "Invalid SpyreTensorLayout pickle v1: wrong tuple size");
+              }
+              return spyre::SpyreTensorLayout(t[1].cast<std::vector<int64_t>>(),
+                                              t[3].cast<std::vector<int64_t>>(),
+                                              t[4].cast<DataFormats>());
+            } else if (version == 2) {
+              // Version 2: (version, device_size, stride_map, device_dtype)
+              if (t.size() != 4) {
+                throw py::value_error(
+                    "Invalid SpyreTensorLayout pickle v2: wrong tuple size");
+              }
+              return spyre::SpyreTensorLayout(t[1].cast<std::vector<int64_t>>(),
+                                              t[2].cast<std::vector<int64_t>>(),
+                                              t[3].cast<DataFormats>());
+            } else {
               throw py::value_error(
                   "Unsupported SpyreTensorLayout pickle version: " +
                   std::to_string(version));
             }
-
-            return spyre::SpyreTensorLayout(t[1].cast<std::vector<int64_t>>(),
-                                            t[2].cast<std::vector<int32_t>>(),
-                                            t[3].cast<std::vector<int64_t>>(),
-                                            t[4].cast<DataFormats>());
           }));
 
   m.def("spyre_empty_with_layout", &spyre::spyre_empty_with_layout);
@@ -384,4 +397,18 @@ PYBIND11_MODULE(_C, m) {
                std::to_string(stream.device().index()) +
                " id=" + std::to_string(stream.id()) + ">";
       });
+  m.def("set_device", [](int idx) {
+    int count = spyre::device_count();
+    TORCH_CHECK(idx >= 0 && idx < count, "Device index ", idx,
+                " out of range [0, ", count, ")");
+    c10::impl::getDeviceGuardImpl(c10::DeviceType::PrivateUse1)
+        ->setDevice(c10::Device(c10::DeviceType::PrivateUse1,
+                                static_cast<c10::DeviceIndex>(idx)));
+  });
+  m.def("current_device", []() {
+    return c10::impl::getDeviceGuardImpl(c10::DeviceType::PrivateUse1)
+        ->getDevice()
+        .index();
+  });
+  m.def("device_count", &spyre::device_count);
 }

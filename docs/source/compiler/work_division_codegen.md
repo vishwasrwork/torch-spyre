@@ -1,5 +1,9 @@
 # Work Division Code Generation
 
+::::{warning}
+This document is stale and may not reflect the current implementation.
+::::
+
 This document describes how work division plans are translated into executable code structures in Torch-Spyre. The code generation phase takes the core division from the planning phase and generates the necessary data structures for runtime execution on the hardware accelerator.
 
 ## Overview
@@ -105,7 +109,7 @@ The code generation phase reads the work division plan produced by the planning 
 The `op_dim_splits` list is operation-centric: it describes how the logical computation is divided, independent of how any particular tensor is laid out in device memory. The code generator uses it directly as `dim_splits` without any mapping through device dimensions.
 
 The code generator uses this information to:
-1. Create the core-to-slice mapping via `calculate_core_to_slice_mapping(dim_labels, dim_splits)`
+1. Create the core-to-slice mapping via `_get_core_to_slice_mapping(iteration_space, dim_splits, num_cores)` (defined in [`superdsc.py`](https://github.com/torch-spyre/torch-spyre/blob/main/torch_spyre/_inductor/codegen/superdsc.py))
 2. Calculate memory offsets for each core
 3. Generate dimension metadata
 4. Produce the SuperDSC structure
