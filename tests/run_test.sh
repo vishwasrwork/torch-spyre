@@ -1420,8 +1420,11 @@ _run_pytest_isolated() {
             rm -rf "${_LOGDIR}"
         else
             echo "[torch_oot_device_tests_run] Running serial test"
+            # Inside _run_pytest_isolated, before the pytest call:
+            _LOG_FILE="spyre_test_$(basename "$_base" .py)_.log"
+            echo "[torch_oot_device_tests_run] Logging to: $_LOG_FILE"
             # Regular pytest for non-distributed tests
-            python3 -m pytest "$_base" "${_args[@]}"
+            python3 -m pytest "$_base" -s -vv -rA "${_args[@]}" 2>&1 | tee "$_LOG_FILE"
             echo $? > "$_exit_tmp"
         fi
     ) || true

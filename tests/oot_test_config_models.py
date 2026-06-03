@@ -46,6 +46,30 @@ class InputInitArgs(BaseModel):
     key: Optional[str] = None  # file: key within file (dict/.safetensors)
 
 
+class SpyreTensorLayoutSpec(BaseModel):
+    """Specifies a SpyreTensorLayout to use when transferring a tensor to Spyre.
+
+    Uses explicit device layout specification:
+    - device_size: explicit device size specification (required)
+    - stride_map: explicit stride map specification (required)
+    - device_dtype: device data format (e.g., DataFormats.IEEE_FP32) (optional)
+    """
+
+    device_size: List[int]
+    stride_map: List[int]
+    device_dtype: Optional[str] = None
+
+    @model_validator(mode="after")
+    def validate_layout_format(self) -> "SpyreTensorLayoutSpec":
+        """Validate device_size and stride_map have matching lengths."""
+        if len(self.device_size) != len(self.stride_map):
+            raise ValueError(
+                f"device_size length ({len(self.device_size)}) must match "
+                f"stride_map length ({len(self.stride_map)})"
+            )
+        return self
+
+
 class InputTensorSpec(BaseModel):
     """Specification for constructing a single input tensor."""
 
@@ -56,6 +80,7 @@ class InputTensorSpec(BaseModel):
     init_args: InputInitArgs = InputInitArgs()
     stride: Optional[List[int]] = None
     storage_offset: int = 0
+    spyre_layout: Optional["SpyreTensorLayoutSpec"] = None
 
     @field_validator("dtype")
     @classmethod
@@ -119,6 +144,103 @@ class InputTensorSpec(BaseModel):
 
     def resolved_dtype(self) -> torch.dtype:
         return _resolve_dtype_str(self.dtype)
+
+    def to_spyre(self, cpu_tensor: torch.Tensor) -> torch.Tensor:
+        """Transfer a CPU tensor to Spyre with explicit SpyreTensorLayout.
+
+        Uses explicit device_size and stride_map to create the layout.
+        Automatically validates the created layout matches the specification.
+        """
+        from torch_spyre._C import (
+            SpyreTensorLayout,
+            DataFormats,
+            set_spyre_tensor_layout,
+            get_spyre_tensor_layout,
+        )
+
+        layout_spec = self.spyre_layout
+
+        if layout_spec is None:
+            print(
+                f"[DEBUG] Transferring tensor {list(cpu_tensor.shape)} to Spyre WITHOUT layout specification"
+            )
+            return cpu_tensor.to("spyre")
+
+        shape = list(cpu_tensor.shape)
+        stride = list(cpu_tensor.stride())
+        dtype = cpu_tensor.dtype
+
+        device_size = layout_spec.device_size
+        stride_map = layout_spec.stride_map
+
+        print(f"\n{'=' * 80}")
+        print("SPYRE LAYOUT DEBUG - Tensor Transfer")
+        print(f"{'=' * 80}")
+        print(f"Tensor shape:     {shape}")
+        print(f"Tensor stride:    {stride}")
+        print(f"Tensor dtype:     {dtype}")
+        print(f"Specified device_size:  {device_size}")
+        print(f"Specified stride_map:   {stride_map}")
+        if layout_spec.device_dtype:
+            print(f"Specified device_dtype: {layout_spec.device_dtype}")
+
+        # Parse device_dtype if specified, resolving "DataFormats.IEEE_FP32" style strings
+        device_dtype = None
+        if layout_spec.device_dtype:
+            device_dtype_str = layout_spec.device_dtype
+            if "DataFormats." in device_dtype_str:
+                device_dtype_str = device_dtype_str.split(".")[-1]
+            device_dtype = getattr(DataFormats, device_dtype_str, None)
+
+        # Build the SpyreTensorLayout from explicit device_size + stride_map
+        print("\n Creating SpyreTensorLayout...")
+        if device_dtype is not None:
+            stl = SpyreTensorLayout(
+                device_size=device_size,
+                stride_map=stride_map,
+                device_dtype=device_dtype,
+            )
+        else:
+            stl = SpyreTensorLayout(  # type: ignore[call-overload]
+                device_size=device_size,
+                stride_map=stride_map,
+            )
+        print(f" Layout created: {stl}")
+
+        # Step 1: move to device; Step 2: apply custom layout
+        print("\n Transferring tensor to Spyre and applying layout...")
+        spyre_tensor = cpu_tensor.to("spyre")
+        set_spyre_tensor_layout(spyre_tensor, stl)
+        print(" Transfer and layout application complete")
+
+        # Validate the applied layout
+        print("\n Validating layout...")
+        actual_layout = get_spyre_tensor_layout(spyre_tensor)
+        actual_ds = list(actual_layout.device_size)
+        actual_sm = list(actual_layout.stride_map)
+
+        print(f"Actual device_size:  {actual_ds}")
+        print(f"Actual stride_map:   {actual_sm}")
+        print(
+            f"{'✓' if actual_ds == device_size else '✗'} device_size {'matches' if actual_ds == device_size else 'MISMATCH!'}"
+        )
+        print(
+            f"{'✓' if actual_sm == stride_map else '✗'} stride_map {'matches' if actual_sm == stride_map else 'MISMATCH!'}"
+        )
+        print(f"{'=' * 80}\n")
+
+        assert actual_ds == device_size, (
+            f"device_size mismatch for tensor shape={shape}:\n"
+            f"  expected: {device_size}\n"
+            f"  actual:   {actual_ds}"
+        )
+        assert actual_sm == stride_map, (
+            f"stride_map mismatch for tensor shape={shape}:\n"
+            f"  expected: {stride_map}\n"
+            f"  actual:   {actual_sm}"
+        )
+
+        return spyre_tensor
 
     def build(self, *, seed: Optional[int]) -> torch.Tensor:
         """Build and return a CPU tensor according to this spec.

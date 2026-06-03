@@ -391,14 +391,48 @@ class TestSpyreModelOps(TestCase):
             SampleInput=SampleInput,
         )
 
-        def _to_target_device(x: Any) -> Any:
+        def _to_target_device(x: Any, arg_spec: Optional[Any] = None) -> Any:
             if torch.is_tensor(x):
+                if (
+                    arg_spec is not None
+                    and hasattr(arg_spec, "tensor")
+                    and hasattr(arg_spec.tensor, "to_spyre")
+                    and arg_spec.tensor.spyre_layout is not None
+                ):
+                    print(
+                        f"[LAYOUT] calling to_spyre() for shape={list(x.shape)}",
+                        file=sys.stderr,
+                        flush=True,
+                    )
+                    return arg_spec.tensor.to_spyre(x)
+                print(
+                    f"[PLAIN]  plain .to(device) for shape={list(x.shape)}",
+                    file=sys.stderr,
+                    flush=True,
+                )
                 return x.to(test_device)
             if isinstance(x, list):
                 return [t.to(test_device) if torch.is_tensor(t) else t for t in x]
             return x
 
-        test_sample: SampleInput = cpu_sample.transform(_to_target_device)
+        # Build test_sample with per-tensor layout awareness
+        test_args = []
+        for i, (cpu_arg, spec_arg) in enumerate(
+            zip(
+                [cpu_sample.input] + list(cpu_sample.args),
+                ops_item.sample_inputs_func.args,
+            )
+        ):
+            test_args.append(_to_target_device(cpu_arg, spec_arg))
+
+        if test_args:
+            test_sample = SampleInput(
+                test_args[0],
+                args=tuple(test_args[1:]),
+                kwargs={k: _to_target_device(v) for k, v in cpu_sample.kwargs.items()},
+            )
+        else:
+            test_sample = cpu_sample.transform(lambda x: _to_target_device(x))
 
         # Adapter pre-hook (e.g. dropout sets training=False)
         if adapter.pre is not None:

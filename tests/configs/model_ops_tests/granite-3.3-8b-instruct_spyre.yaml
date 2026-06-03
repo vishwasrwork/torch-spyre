@@ -397,12 +397,16 @@ test_suite_config:
                   sample_inputs_func:
                     args:
                       - tensor:
-                          shape: [1, 41, 4096]
-                          stride: [167936, 4096, 1]
+                          shape: [1, 128]
+                          stride: [128, 1]
                           storage_offset: 0
-                          dtype: torch.float16
+                          dtype: torch.float32
                           device: cuda:0
                           init: rand
+                          spyre_layout:
+                            device_size: [4, 1, 32]
+                            stride_map: [32, -1, 1]
+                            device_dtype: DataFormats.IEEE_INT32
                       - value: -1
                   description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/models/granite/modeling_granite.py#L201 in forward,
                     code: variance = hidden_states.pow(2).mean(-1, keepdim=True)'
@@ -668,12 +672,16 @@ test_suite_config:
                   sample_inputs_func:
                     args:
                       - tensor:
-                          shape: [1, 32, 41, 64]
-                          stride: [167936, 128, 4096, 1]
+                          shape: [128, 4096]
+                          stride: [4096, 1]
                           storage_offset: 64
-                          dtype: torch.float16
+                          dtype: torch.float32
                           device: cuda:0
                           init: rand
+                          spyre_layout:
+                            device_size: [128, 128, 32]
+                            stride_map: [32, 4096, 1]
+                            device_dtype: DataFormats.IEEE_FP32
                   description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/models/granite/modeling_granite.py#L51 in rotate_half,
                     code: return torch.cat((-x2, x1), dim=-1)'
                   tags:
@@ -747,19 +755,27 @@ test_suite_config:
                   sample_inputs_func:
                     args:
                       - tensor:
-                          shape: [1, 8, 41, 128]
-                          stride: [41984, 128, 1024, 1]
+                          shape: [128, 12800]
+                          stride: [12800, 1]
                           storage_offset: 0
-                          dtype: torch.float16
+                          dtype: torch.float32
                           device: cuda:0
                           init: rand
+                          spyre_layout:
+                            device_size: [400, 128, 32]
+                            stride_map: [32, 12800, 1]
+                            device_dtype: DataFormats.IEEE_FP32
                       - tensor:
-                          shape: [1, 1, 41, 128]
-                          stride: [5248, 5248, 128, 1]
+                          shape: [128, 12800]
+                          stride: [12800, 1]
                           storage_offset: 0
-                          dtype: torch.float16
+                          dtype: torch.float32
                           device: cuda:0
                           init: rand
+                          spyre_layout:
+                            device_size: [400, 128, 32]
+                            stride_map: [32, 12800, 1]
+                            device_dtype: DataFormats.IEEE_FP32
                   description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/models/granite/modeling_granite.py#L76 in apply_rotary_pos_emb,
                     code: k_embed = (k * cos) + (rotate_half(k) * sin)'
                   tags:
@@ -784,12 +800,16 @@ test_suite_config:
                   sample_inputs_func:
                     args:
                       - tensor:
-                          shape: [1, 8, 41, 64]
-                          stride: [41984, 128, 1024, 1]
+                          shape: [128, 1024]
+                          stride: [1024, 1]
                           storage_offset: 64
-                          dtype: torch.float16
+                          dtype: torch.float32
                           device: cuda:0
                           init: rand
+                          spyre_layout:
+                            device_size: [32, 128, 32]
+                            stride_map: [32, 1024, 1]
+                            device_dtype: DataFormats.IEEE_FP32
                   description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/models/granite/modeling_granite.py#L51 in rotate_half,
                     code: return torch.cat((-x2, x1), dim=-1)'
                   tags:
@@ -959,26 +979,38 @@ test_suite_config:
                   sample_inputs_func:
                     args:
                       - tensor:
-                          shape: [1, 32, 41, 128]
-                          stride: [167936, 128, 4096, 1]
+                          shape: [128, 4096]
+                          stride: [4096, 1]
                           storage_offset: 0
-                          dtype: torch.float16
+                          dtype: torch.float32
                           device: cuda:0
                           init: rand
+                          spyre_layout:
+                            device_size: [128, 128, 32]
+                            stride_map: [32, 4096, 1]
+                            device_dtype: DataFormats.IEEE_FP32
                       - tensor:
-                          shape: [1, 32, 2048, 128]
-                          stride: [8388608, 262144, 128, 1]
+                          shape: [1, 64, 128]
+                          stride: [8192, 128, 1]
                           storage_offset: 0
-                          dtype: torch.float16
+                          dtype: torch.float32
                           device: cuda:0
                           init: rand
+                          spyre_layout:
+                            device_size: [64, 4, 1, 32]
+                            stride_map: [128, 32, -1, 1]
+                            device_dtype: DataFormats.IEEE_FP32
                       - tensor:
-                          shape: [1, 32, 2048, 128]
-                          stride: [8388608, 262144, 128, 1]
+                          shape: [1, 32, 128, 128]
+                          stride: [524288, 16384, 128, 1]
                           storage_offset: 0
-                          dtype: torch.float16
+                          dtype: torch.float32
                           device: cuda:0
                           init: rand
+                          spyre_layout:
+                            device_size: [32, 128, 4, 1, 32]
+                            stride_map: [16384, 128, 32, -1, 1]
+                            device_dtype: DataFormats.IEEE_FP32
                   description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/integrations/sdpa_attention.py#L92 in sdpa_attention_forward,
                     code: attn_output = torch.nn.functional.scaled_dot_product_attention('
                   tags:
@@ -1089,12 +1121,16 @@ test_suite_config:
                   sample_inputs_func:
                     args:
                       - tensor:
-                          shape: [1, 1, 49159]
-                          stride: [49159, 49159, 1]
+                          shape: [128, 49159]
+                          stride: [49159, 1]
                           storage_offset: 0
-                          dtype: torch.float16
+                          dtype: torch.float32
                           device: cuda:0
                           init: rand
+                          spyre_layout:
+                            device_size: [1537, 128, 32]
+                            stride_map: [32, 49159, 1]
+                            device_dtype: DataFormats.IEEE_FP32
                       - value: 16.0
                   description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/models/granite/modeling_granite.py#L576 in torch_dynamo_resume_in_forward_at_575,
                     code: logits = logits / self.config.logits_scaling  # main diff with Llama'
