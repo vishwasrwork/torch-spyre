@@ -6,6 +6,8 @@ Pydantic models for the OOT PyTorch test framework YAML config.
 Used by oot_test_parsing.py to validate and parse the YAML config.
 """
 
+import logging
+import sys
 import warnings
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Union
@@ -14,14 +16,14 @@ import torch
 from pydantic import BaseModel, field_validator, model_validator  # type: ignore
 
 from .oot_test_constants import (
+    REL_PATH_TOKENS,
+    DTYPE_STR_MAP,
+    MODE_MANDATORY_SUCCESS,
+    MODE_XFAIL,
     _VALID_DTYPE_STRINGS,
     _VALID_INIT_STRATEGIES,
     _VALID_TEST_MODES,
     _VALID_UNLISTED_MODES,
-    DTYPE_STR_MAP,
-    MODE_MANDATORY_SUCCESS,
-    MODE_XFAIL,
-    REL_PATH_TOKENS,
 )
 from .oot_test_matching import parse_dtype
 from .oot_test_utilities import (
@@ -29,6 +31,49 @@ from .oot_test_utilities import (
     _resolve_dtype_str,
     _resolve_tensor_path,
 )
+
+# Logger setup
+logger = logging.getLogger(__name__)
+logger.setLevel(logging.INFO)
+if not logger.handlers:
+    _handler = logging.StreamHandler(sys.stderr)
+    _handler.setFormatter(logging.Formatter("%(levelname)s %(name)s: %(message)s"))
+    logger.addHandler(_handler)
+
+# Maps the friendly dtype names used in yaml configs to the DataFormats enum.
+# Verified against DataFormats.__members__:
+# ['SEN169_FP16', 'IEEE_FP32', 'INVALID', 'SEN143_FP8', 'SEN152_FP8', 'SEN153_FP9',
+#  'SENINT2', 'SENINT4', 'SENINT8', 'SENINT16', 'SENINT24', 'IEEE_INT64', 'IEEE_INT32',
+#  'SENUINT32', 'SENUINT2', 'IEEE_FP16', 'BOOL', 'BFLOAT16', 'SEN18F_FP24']
+_YAML_DTYPE_TO_DATAFORMAT = {
+    "bfloat16": "BFLOAT16",
+    "bool": "BOOL",
+    "float16": "IEEE_FP16",
+    "float32": "IEEE_FP32",
+    "int32": "IEEE_INT32",
+    "int64": "IEEE_INT64",
+}
+
+
+def _resolve_device_dtype(device_dtype_str: str):
+    """Resolve a yaml device_dtype string to a DataFormats member."""
+    from torch_spyre._C import DataFormats
+
+    bare_name = (
+        device_dtype_str.split(".")[-1]
+        if "DataFormats." in device_dtype_str
+        else device_dtype_str
+    )
+    if hasattr(DataFormats, bare_name):
+        return getattr(DataFormats, bare_name)
+
+    if device_dtype_str in _YAML_DTYPE_TO_DATAFORMAT:
+        return getattr(DataFormats, _YAML_DTYPE_TO_DATAFORMAT[device_dtype_str])
+
+    raise ValueError(
+        f"Unrecognized device_dtype '{device_dtype_str}'; expected a DataFormats "
+        f"member name (e.g. 'IEEE_FP32') or one of {list(_YAML_DTYPE_TO_DATAFORMAT)}"
+    )
 
 
 # ---------------------------
@@ -46,6 +91,30 @@ class InputInitArgs(BaseModel):
     key: Optional[str] = None  # file: key within file (dict/.safetensors)
 
 
+class SpyreTensorLayoutSpec(BaseModel):
+    """Specifies a SpyreTensorLayout to use when transferring a tensor to Spyre.
+
+    Uses explicit device layout specification:
+    - device_size: explicit device size specification (required)
+    - stride_map: explicit stride map specification (required)
+    - device_dtype: device data format (e.g., DataFormats.IEEE_FP32) (optional)
+    """
+
+    device_size: List[int]
+    stride_map: List[int]
+    device_dtype: str
+
+    @model_validator(mode="after")
+    def validate_layout_format(self) -> "SpyreTensorLayoutSpec":
+        """Validate device_size and stride_map have matching lengths."""
+        if len(self.device_size) != len(self.stride_map):
+            raise ValueError(
+                f"device_size length ({len(self.device_size)}) must match "
+                f"stride_map length ({len(self.stride_map)})"
+            )
+        return self
+
+
 class InputTensorSpec(BaseModel):
     """Specification for constructing a single input tensor."""
 
@@ -56,6 +125,7 @@ class InputTensorSpec(BaseModel):
     init_args: InputInitArgs = InputInitArgs()
     stride: Optional[List[int]] = None
     storage_offset: int = 0
+    device_layout: Optional["SpyreTensorLayoutSpec"] = None
 
     @field_validator("dtype")
     @classmethod
@@ -119,6 +189,75 @@ class InputTensorSpec(BaseModel):
 
     def resolved_dtype(self) -> torch.dtype:
         return _resolve_dtype_str(self.dtype)
+
+    def to_spyre(self, cpu_tensor: torch.Tensor) -> torch.Tensor:
+        """Transfer a CPU tensor to Spyre with explicit SpyreTensorLayout.
+
+        Uses explicit device_size and stride_map to create the layout.
+        Automatically validates the created layout matches the specification.
+        """
+        from torch_spyre._C import SpyreTensorLayout, get_spyre_tensor_layout
+
+        layout_spec = self.device_layout
+        assert layout_spec is not None, (
+            "to_spyre() should only be called when device_layout is set"
+        )
+
+        shape = list(cpu_tensor.shape)
+        stride = list(cpu_tensor.stride())
+        dtype = cpu_tensor.dtype
+
+        device_size = layout_spec.device_size
+        stride_map = layout_spec.stride_map
+        device_dtype = _resolve_device_dtype(layout_spec.device_dtype)
+
+        logger.debug(
+            "Transferring tensor shape=%s stride=%s dtype=%s to Spyre with "
+            "device_size=%s stride_map=%s device_dtype=%s",
+            shape,
+            stride,
+            dtype,
+            device_size,
+            stride_map,
+            layout_spec.device_dtype,
+        )
+
+        # Build the SpyreTensorLayout from explicit device_size + stride_map
+        stl = SpyreTensorLayout(
+            device_size=device_size,
+            stride_map=stride_map,
+            device_dtype=device_dtype,
+        )
+        logger.debug("Layout created: %s", stl)
+
+        # Step 1: move to device; Step 2: apply custom layout
+        spyre_tensor = cpu_tensor.to("spyre", device_layout=stl)
+
+        # Validate the applied layout
+        actual_layout = get_spyre_tensor_layout(spyre_tensor)
+        actual_ds = list(actual_layout.device_size)
+        actual_sm = list(actual_layout.stride_map)
+
+        logger.debug(
+            "Validated layout: actual device_size=%s (expected %s), actual stride_map=%s (expected %s)",
+            actual_ds,
+            device_size,
+            actual_sm,
+            stride_map,
+        )
+
+        assert actual_ds == device_size, (
+            f"device_size mismatch for tensor shape={shape}:\n"
+            f"  expected: {device_size}\n"
+            f"  actual:   {actual_ds}"
+        )
+        assert actual_sm == stride_map, (
+            f"stride_map mismatch for tensor shape={shape}:\n"
+            f"  expected: {stride_map}\n"
+            f"  actual:   {actual_sm}"
+        )
+
+        return spyre_tensor
 
     def build(self, *, seed: Optional[int]) -> torch.Tensor:
         """Build and return a CPU tensor according to this spec.
@@ -460,11 +599,25 @@ class InputsEdits(BaseModel):
         4. pass through as-is
 
         None, bool, and numeric values pass through unchanged.
+
+        Note: kwargs do not currently support tensor construction or
+        device_layout the way positional args do (see InputArg / InputsEdits.
+        build_cpu_args()). No existing config passes a tensor/device_layout via
+        kwargs, so this raises loudly if one ever tries to, rather than
+        silently passing an unbuilt spec through as a raw dict.
         """
         import ast as _ast
 
         out: Dict[str, Any] = {}
         for k, v in self.kwargs.items():
+            if isinstance(v, dict) and ("tensor" in v or "device_layout" in v):
+                raise NotImplementedError(
+                    f"kwarg {k!r} looks like a tensor/layout spec ({v!r}), but "
+                    f"kwargs do not currently support tensor construction or "
+                    f"device_layout — only args do. Move this to 'args' instead, "
+                    f"or extend InputsEdits.resolved_kwargs()/build_cpu_kwargs() "
+                    f"if kwarg tensors are genuinely needed."
+                )
             if isinstance(v, str):
                 # 1. dtype resolution
                 bare = v.removeprefix("torch.")
