@@ -8,6 +8,11 @@ in a model by:
 3. Running a forward pass to capture module inputs
 4. Analyzing captured data to generate YAML config
 
+Each captured tensor's forward_inputs spec also includes a spyre_tensor_layout
+block (size/stride/device_size/stride_map/device_dtype) describing how that
+tensor would be stickified on a Spyre device, computed directly from the
+tensor's host shape/dtype via torch_spyre's SpyreTensorLayout.
+
 Usage:
     python auto_generate_module_config.py --model_path ibm-granite/granite-3.3-8b-instruct --seq_len 128
 """
@@ -45,6 +50,21 @@ try:
 except ImportError:
     existing_modules = set()
     logger.warning("could not import module_db, will not filter duplicates")
+
+
+# SpyreTensorLayout lets us compute the device-side ("stickified") layout for
+# a tensor directly from its host size/stride/dtype, the same way
+# granite_layouts_final.py's make_stub() does when post-processing Inductor
+# IR. Here we use it standalone (no Inductor graph needed) to attach a
+# spyre_tensor_layout to every captured tensor spec.
+try:
+    from torch_spyre._C import SpyreTensorLayout
+except ImportError:
+    SpyreTensorLayout = None
+    logger.warning(
+        "could not import torch_spyre._C.SpyreTensorLayout; "
+        "generated config will not include spyre_tensor_layout entries"
+    )
 
 
 class PrettyDumper(yaml.SafeDumper):
@@ -537,6 +557,55 @@ def _convert_constructor_arg_to_sample_input(
         return {"value": None}
 
 
+def _compute_spyre_tensor_layout(
+    shape: List[int], dtype_str: str
+) -> Dict[str, Any] | None:
+    """
+    Compute the Spyre device tensor layout ("stickified" layout) for a tensor
+    of the given host shape/dtype.
+
+    Mirrors the stickification logic used in granite_layouts_final.py's
+    make_stub(): a SpyreTensorLayout is built directly from the host
+    size/stride/dtype using the default (row-major) dim order, and its
+    device_size / stride_map / device_dtype are read off the result. Unlike
+    make_stub(), no Inductor graph or FixedTiledLayout is needed here since
+    we only need the device layout, not a host IR node.
+
+    Returns None if torch_spyre's SpyreTensorLayout isn't available or the
+    layout can't be computed (e.g. unsupported dtype/shape combination).
+    """
+    if SpyreTensorLayout is None:
+        return None
+
+    torch_dtype = getattr(torch, dtype_str.replace("torch.", ""), None)
+    if not isinstance(torch_dtype, torch.dtype):
+        logger.warning(f"Unrecognized dtype '{dtype_str}', skipping spyre_tensor_layout")
+        return None
+
+    size = [int(s) for s in shape]
+    # Default contiguous (row-major) host stride for a freshly-allocated
+    # sample tensor of this shape - matches how forward_inputs tensors are
+    # actually instantiated at test time (init: randn/zeros/randint).
+    stride = list(torch.empty(size).stride())
+    dim_order = list(range(len(size)))
+
+    try:
+        stl = SpyreTensorLayout(size, stride, torch_dtype, dim_order)
+    except Exception:
+        logger.exception(
+            f"Failed to compute spyre_tensor_layout for shape={size}, dtype={torch_dtype}"
+        )
+        return None
+
+    return {
+        "size": size,
+        "stride": stride,
+        "device_size": list(stl.device_size),
+        "stride_map": list(stl.stride_map),
+        "device_dtype": str(stl.device_dtype),
+    }
+
+
 def _tensor_info_to_spec(tensor_info: Dict[str, Any], name: str) -> Dict[str, Any]:
     """
     Convert a single tensor info dict to sample_inputs tensor spec format.
@@ -568,6 +637,10 @@ def _tensor_info_to_spec(tensor_info: Dict[str, Any], name: str) -> Dict[str, An
 
     if init_args:
         tensor_spec["init_args"] = init_args
+
+    spyre_tensor_layout = _compute_spyre_tensor_layout(tensor_info["shape"], dtype)
+    if spyre_tensor_layout is not None:
+        tensor_spec["spyre_tensor_layout"] = spyre_tensor_layout
 
     return tensor_spec
 
